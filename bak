@@ -1,0 +1,20 @@
+#!/bin/sh
+
+if [ "$#" -ne 1 ]; then
+	echo "Usage: bak <file_path>"
+	exit 1
+fi
+
+file_path="$1"
+
+if [ ! -e "$file_path" ]; then
+	echo "[E] File '$file_path' does not exist."
+	exit 1
+fi
+
+if [ "${file_path##*.}" = "bak" ]; then
+	mv "$file_path" "${file_path%.bak}"
+else
+	mv "$file_path" "$file_path.bak"
+fi
+
