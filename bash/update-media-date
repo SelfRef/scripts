@@ -1,0 +1,42 @@
+#!/bin/bash
+
+if [ -z "$1" ]; then
+  echo "Usage: $0 YYYY-MM-DD"
+  exit 1
+fi
+
+NEW_DATE_HYPHEN="$1"
+NEW_DATE_COLON="${NEW_DATE_HYPHEN//-/:}"
+
+shopt -s nullglob
+
+for f in *.mp4 *.MP4 *.jpg *.JPG *.jpeg *.JPEG; do
+  echo "Processing: $f"
+
+  # Get current exif date-time for time component (prefer CreateDate or DateTimeOriginal)
+  if [[ "$f" == *.mp4 || "$f" == *.MP4 ]]; then
+    datetime=$(exiftool -s -s -s -CreateDate "$f")
+    time=${datetime#* }
+    # Update MP4 exif metadata
+    exiftool -overwrite_original \
+      "-CreateDate=${NEW_DATE_COLON} ${time}" \
+      "-ModifyDate=${NEW_DATE_COLON} ${time}" \
+      "-TrackCreateDate=${NEW_DATE_COLON} ${time}" \
+      "-TrackModifyDate=${NEW_DATE_COLON} ${time}" \
+      "-MediaCreateDate=${NEW_DATE_COLON} ${time}" \
+      "-MediaModifyDate=${NEW_DATE_COLON} ${time}" \
+      "$f"
+  else
+    datetime=$(exiftool -s -s -s -DateTimeOriginal "$f")
+    time=${datetime#* }
+    # Update JPEG exif metadata
+    exiftool -overwrite_original \
+      "-DateTimeOriginal=${NEW_DATE_COLON} ${time}" \
+      "-CreateDate=${NEW_DATE_COLON} ${time}" \
+      "-ModifyDate=${NEW_DATE_COLON} ${time}" \
+      "$f"
+  fi
+
+  # Update filesystem modified time
+  touch -d "${NEW_DATE_HYPHEN} ${time}" "$f"
+done
