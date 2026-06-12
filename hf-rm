@@ -151,10 +151,26 @@ else
 fi
 
 if [[ "$reply" == y || "$reply" == Y ]]; then
-    rm "$found_link"
+    # Remove symlink, retry with sudo if permission denied
+    if ! rm "$found_link" 2>/dev/null; then
+        echo "  Permission denied, retrying with sudo..."
+        sudo rm "$found_link"
+    fi
     echo "  Symlink removed: $file_name"
     if (( blob_refs == 1 )); then
-        rm "$found_blob"
+        # Remove blob, retry with sudo if permission denied
+        if ! rm "$found_blob" 2>/dev/null; then
+            echo "  Permission denied, retrying with sudo..."
+            sudo rm "$found_blob"
+        filink"
+    fi
+    echo "  Symlink removed: $file_name"
+    if (( blob_refs == 1 )); then
+        # Remove blob, retry with sudo if permission denied
+        if ! rm "$found_blob" 2>/dev/null; then
+            echo "  Permission denied, retrying with sudo..."
+            sudo rm "$found_blob"
+        fi
         echo "  Blob removed: $found_hash"
     fi
     echo "  Done."
