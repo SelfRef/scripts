@@ -1,0 +1,103 @@
+#!/usr/bin/env bash
+# hf-list -- List downloaded HuggingFace models in a tree view.
+# Usage: ./hf-list [repo_pattern]
+#
+# Shows models from the HF cache.  Respects $HF_HOME;
+# when unset defaults to /media/cache0/huggingface.
+
+set -euo pipefail
+
+HF_HOME="${HF_HOME:-/media/cache0/huggingface}"
+HUB="$HF_HOME/hub"
+
+[[ -d "$HUB" ]] || { echo "Cache not found: $HUB" >&2; exit 1; }
+
+# Human-readable bytes.
+hr() {
+    local b=$1
+    if (( b >= 1073741824 )); then
+        awk "BEGIN{printf \"%.1f Gi\n\", $b/1073741824}"
+    elif (( b >= 1048576 )); then
+        awk "BEGIN{printf \"%.1f Mi\n\", $b/1048576}"
+    elif (( b >= 1024 )); then
+        awk "BEGIN{printf \"%.1f Ki\n\", $b/1024}"
+    else
+        printf '%d B\n' "$b"
+    fi
+}
+
+mapfile -t models < <(find "$HUB" -maxdepth 1 -mindepth 1 -type d -name 'models--*' | sort)
+
+if (( ${#models[@]} == 0 )); then
+    echo "No downloaded models found."
+    exit 0
+fi
+
+pat="${1:-}"
+grand_total=0
+shown=0
+
+for mdir in "${models[@]}"; do
+    rid="$(basename "$mdir" | sed 's/^models--//; s/--/\//g')"
+    [[ -n "$pat" ]] && [[ "$rid" != *"$pat"* ]] && continue
+
+    shown=$((shown + 1))
+
+    hash=""
+    if [[ -f "$mdir/refs/main" ]]; then
+        hash="$(tr -d '[:space:]' < "$mdir/refs/main")"
+    fi
+    if [[ -z "$hash" ]]; then
+        hash="$(find "$mdir/refs" -maxdepth 1 -type f ! -name 'main' \
+                  -exec cat {} + 2>/dev/null | tr -d '[:space:]' | head -1 || true)"
+    fi
+
+    snap="$mdir/snapshots/$hash"
+    [[ -d "$snap" ]] || snap="$(find "$mdir/snapshots" -maxdepth 1 -type d | head -1)"
+
+    model_size=0
+    if [[ -d "${snap:-/dev/null}" ]]; then
+        while IFS= read -r -d '' link; do
+            blob="$(realpath "$link" 2>/dev/null)" || continue
+            [[ -f "$blob" ]] || continue
+            sz="$(stat -c '%s' "$blob" 2>/dev/null)" || sz=0
+            model_size=$((model_size + sz))
+        done < <(find "$snap" -maxdepth 1 -mindepth 1 -type l -print0 2>/dev/null)
+    fi
+    grand_total=$((grand_total + model_size))
+
+    nfiles=0
+    mapfile -t files < <(find "${snap:-/dev/null}" -maxdepth 1 -mindepth 1 -type l 2>/dev/null | sort)
+
+    printf '  ├── %-45s   [%s]\n' "$rid" "$(hr "$model_size")"
+
+    # pass 1: collect names + sizes, pass 2: print aligned
+    max_size_len=0
+    declare -a names=() sizes=()
+
+    for link in "${files[@]}"; do
+        [[ -z "$link" ]] && continue
+        [[ -d "$link" ]] && continue
+        blob="$(realpath "$link" 2>/dev/null)" || continue
+        [[ -f "$blob" ]] || continue
+        sz="$(stat -c '%s' "$blob" 2>/dev/null)" || sz=0
+        sizes[$nfiles]="$(hr "$sz")"
+        names[$nfiles]="$(basename "$link")"
+        nfiles=$((nfiles + 1))
+        slen=${#sizes[$((nfiles - 1))]}
+        (( slen > max_size_len )) && max_size_len=$slen
+    done
+
+    pad=$(( max_size_len > 10 ? max_size_len : 10 ))
+
+    for (( i=0; i<nfiles; i++ )); do
+        if (( i == nfiles - 1 )); then
+            printf '  │   └─ %-45s %*s\n' "${names[$i]}" "$pad" "${sizes[$i]}"
+        else
+            printf '  │   ├─ %-45s %*s\n' "${names[$i]}" "$pad" "${sizes[$i]}"
+        fi
+    done
+done
+
+echo ""
+echo "=== $shown model(s), total $(hr "$grand_total") ==="

@@ -1,0 +1,164 @@
+#!/usr/bin/env bash
+# hf-rm -- Remove a specific file from a downloaded HuggingFace model.
+# Usage: ./hf-rm <model_id> <filename>
+#
+# Example:
+#   ./hf-rm unsloth/Qwen3.6-35B-A3B-GGUF mmproj-BF16.gguf
+#
+# Removes the snapshot symlink AND the blob file.
+# If the blob is shared across multiple snapshots (rare), it preserves
+# the blob and only removes the symlink.
+#
+# If no filename is given, lists files for the model.
+
+set -euo pipefail
+
+HF_HOME="${HF_HOME:-/media/cache0/huggingface}"
+HUB="$HF_HOME/hub"
+
+[[ -d "$HUB" ]] || { echo "Cache not found: $HUB" >&2; exit 1; }
+
+# -- Helpers ---------------------------------------------------------------
+
+model_dir() {
+    local repo_id="$1"
+    local encoded="${repo_id//\//--}"
+    find "$HUB" -maxdepth 1 -mindepth 1 -type d -name "models--${encoded}" | head -1
+}
+
+human_size() {
+    local b=$1
+    if (( b >= 1073741824 )); then
+        awk "BEGIN{printf \"%.1f Gi\n\", $b/1073741824}"
+    elif (( b >= 1048576 )); then
+        awk "BEGIN{printf \"%.1f Mi\n\", $b/1048576}"
+    elif (( b >= 1024 )); then
+        awk "BEGIN{printf \"%.1f Ki\n\", $b/1024}"
+    else
+        printf '%d B\n' "$b"
+    fi
+}
+
+# Resolve snapshot dir from refs/main (or fallback ref).
+resolve_snap() {
+    local mdir="$1"
+    local hash=""
+    if [[ -f "$mdir/refs/main" ]]; then
+        hash="$(tr -d '[:space:]' < "$mdir/refs/main")"
+    fi
+    if [[ -z "$hash" ]]; then
+        hash="$(find "$mdir/refs" -maxdepth 1 -type f ! -name 'main' \
+                  -exec cat {} + 2>/dev/null | tr -d '[:space:]' | head -1 || true)"
+    fi
+    local snap="$mdir/snapshots/$hash"
+    if [[ ! -d "$snap" ]]; then
+        snap="$(find "$mdir/snapshots" -maxdepth 1 -type d | head -1)"
+    fi
+    echo "$snap"
+}
+
+# -- Main -------------------------------------------------------------------
+
+model_id="${1:-}"
+file_name="${2:-}"
+
+if [[ -z "$model_id" ]]; then
+    echo "Usage: $0 <model_id> [filename]" >&2
+    echo "  <model_id>  e.g. unsloth/Qwen3.6-35B-A3B-GGUF" >&2
+    echo "  <filename>  remove this file (omit to list files)" >&2
+    exit 1
+fi
+
+mdir="$(model_dir "$model_id")"
+if [[ -z "$mdir" ]]; then
+    echo "Model not found: $model_id" >&2
+    exit 1
+fi
+
+snap="$(resolve_snap "$mdir")"
+
+# -- List files if no filename given ----------------------------------------
+if [[ -z "$file_name" ]]; then
+    nfiles=0
+    max_size_len=0
+    declare -a names=() sizes=()
+
+    while IFS= read -r -d '' link; do
+        blob="$(realpath "$link" 2>/dev/null)" || continue
+        [[ -f "$blob" ]] || continue
+        sz="$(stat -c '%s' "$blob" 2>/dev/null)" || sz=0
+        sizes[$nfiles]="$(human_size "$sz")"
+        names[$nfiles]="$(basename "$link")"
+        nfiles=$((nfiles + 1))
+        slen=${#sizes[$((nfiles - 1))]}
+        (( slen > max_size_len )) && max_size_len=$slen
+    done < <(find "$snap" -maxdepth 1 -mindepth 1 -type l -print0 2>/dev/null | sort -z)
+
+    pad=$(( max_size_len > 10 ? max_size_len : 10 ))
+    for (( i=0; i<nfiles; i++ )); do
+        printf '  %-40s %*s\n' "${names[$i]}" "$pad" "${sizes[$i]}"
+    done
+    exit 0
+fi
+
+# -- Remove the specific file -----------------------------------------------
+
+# Find the symlink matching this filename
+found_link=""
+found_blob=""
+found_hash=""
+
+while IFS= read -r -d '' link; do
+    bn="$(basename "$link")"
+    if [[ "$bn" == "$file_name" ]]; then
+        found_link="$link"
+        found_blob="$(realpath "$link" 2>/dev/null)"
+        found_hash="$(basename "$found_blob")"
+        break
+    fi
+done < <(find "$snap" -maxdepth 1 -mindepth 1 -type l -print0 2>/dev/null)
+
+if [[ -z "$found_link" ]]; then
+    echo "File '$file_name' not found in model" >&2
+    echo "Use '$0 $model_id' (no filename) to list available files." >&2
+    exit 1
+fi
+
+# Safety: ask for confirmation
+echo "Removing $file_name from $model_id"
+echo "  Link: $found_link"
+echo "  Blob: $found_blob ($(human_size "$(stat -c '%s' "$found_blob")"))"
+
+# Count how many snapshots within THIS model still reference the blob
+blob_refs=0
+for ref_dir in "$mdir"/snapshots/*/; do
+    [[ -d "$ref_dir" ]] || continue
+    while IFS= read -r -d '' candidate; do
+        ref_blob="$(realpath "$candidate" 2>/dev/null)" || continue
+        [[ "$ref_blob" == "$found_blob" ]] && blob_refs=$((blob_refs + 1))
+    done < <(find "$ref_dir" -maxdepth 1 -type l -print0 2>/dev/null)
+done
+
+echo "  Refs: $blob_refs snapshot(s) reference this blob"
+
+# Only delete the blob if it's used by exactly one snapshot (this model).
+if (( blob_refs == 1 )); then
+    echo "  Action: remove symlink + blob file"
+    read -rp "  Confirm? (y/N): " reply
+else
+    echo "  Action: remove symlink only (blob shared)"
+    reply="y"
+fi
+
+if [[ "$reply" == y || "$reply" == Y ]]; then
+    rm "$found_link"
+    echo "  Symlink removed: $file_name"
+    if (( blob_refs == 1 )); then
+        rm "$found_blob"
+        echo "  Blob removed: $found_hash"
+    fi
+    echo "  Done."
+else
+    echo "  Aborted."
+    exit 0
+fi
