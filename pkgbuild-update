@@ -1,0 +1,186 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$SCRIPT_DIR"
+
+# ─── Pre-flight ───────────────────────────────────────────────
+if [[ ! -f PKGBUILD ]]; then
+    echo "ERROR: PKGBUILD not found in $(pwd)"
+    exit 1
+fi
+
+# ─── Helpers ──────────────────────────────────────────────────
+# Extract the raw value of a top-level variable from PKGBUILD.
+get_var() {
+    local varname="$1"
+    local val
+    val="$(grep -m1 "^${varname}=" PKGBUILD | sed "s/^${varname}=//")"
+    # Strip surrounding quotes (single or double)
+    val="${val#\"}" ; val="${val%\"}"
+    val="${val#\'}" ; val="${val%\'}"
+    echo "$val"
+}
+
+# ─── Parse package metadata ───────────────────────────────────
+raw_pkgname="$(get_var pkgname)"
+# Handle pkgname=('jan') or pkgname=${_pkgbase}
+PKGNAME="$raw_pkgname"
+if [[ "$PKGNAME" == \'*\' ]]; then
+    PKGNAME="${PKGNAME#\\'}"
+    PKGNAME="${PKGNAME%\\'}"
+fi
+
+# Resolve common variable references used in AUR PKGBUILDs
+if [[ "$PKGNAME" =~ ^\$\{(.+)\}$ ]]; then
+    ref="${BASH_REMATCH[1]}"
+    resolved="$(get_var "$ref")"
+    # Strip quotes from resolved value if needed
+    resolved="${resolved#\"}" ; resolved="${resolved%\"}"
+    resolved="${resolved#\'}" ; resolved="${resolved%\'}"
+    if [[ -n "$resolved" ]]; then
+        PKGNAME="$resolved"
+    fi
+fi
+
+IS_GIT=0
+if [[ "$PKGNAME" == *-git ]]; then
+    IS_GIT=1
+fi
+
+# ─── GitHub helpers ───────────────────────────────────────────
+extract_github_repo() {
+    # Pull the first source line, grab https://github.com/OWNER/REPO
+    local src
+    src="$(grep -m1 '^source=' PKGBUILD)"
+    if [[ "$src" =~ github\.com/([^/]+)/([^/#.]+) ]]; then
+        echo "${BASH_REMATCH[1]}/${BASH_REMATCH[2]}"
+    fi
+}
+
+fetch_latest_tag() {
+    local repo="$1"
+    curl -fsSL "https://api.github.com/repos/${repo}/releases/latest" 2>/dev/null \
+        | grep -m1 '"tag_name"' \
+        | sed 's/.*"tag_name": *"//;s/".*//' || true
+}
+
+# ─── GIT package path ─────────────────────────────────────────
+if (( IS_GIT )); then
+    echo "==> -git package: $PKGNAME"
+
+    # 1. Update .SRCINFO
+    echo "==> Generating .SRCINFO ..."
+    if makepkg --printsrcinfo > .SRCINFO 2>/dev/null; then
+        echo "==> .SRCINFO updated."
+    else
+        echo "==> makepkg --printsrcinfo failed (dependencies may be needed)."
+    fi
+
+    # 2. Check if pkgver (short commit hash) changed
+    old_ver="$(get_var pkgver)"
+    srcdir="$SCRIPT_DIR/src/${PKGNAME%-git}"
+
+    # Determine the tracked branch (default: master)
+    branch="master"
+    if grep -q '#branch=' PKGBUILD; then
+        branch="$(grep -m1 '^source=' PKGBUILD | grep -o '#branch=[^ ]*' | cut -d= -f2)"
+    fi
+
+    if [[ -d "$srcdir/.git" ]]; then
+        (cd "$srcdir" && git fetch origin "$branch" 2>/dev/null) || true
+        new_ver="$(cd "$srcdir" && git rev-parse --short=8 "origin/$branch" 2>/dev/null)" || new_ver=""
+    else
+        new_ver=""
+    fi
+
+    if [[ -z "$new_ver" ]]; then
+        echo "==> WARNING: Could not resolve remote commit. pkgver unchanged ($old_ver)."
+    elif [[ "$old_ver" != "$new_ver" ]]; then
+        echo "==> pkgver changed: $old_ver → $new_ver"
+        sed -i "s/^pkgver=.*/pkgver=$new_ver/" PKGBUILD
+        echo "==> PKGBUILD updated."
+    else
+        echo "==> pkgver unchanged ($old_ver). No changes made."
+    fi
+
+    exit 0
+fi
+
+# ─── Release package path ─────────────────────────────────────
+echo "==> Release package: $PKGNAME"
+
+GITHUB_REPO="$(extract_github_repo)"
+if [[ -z "$GITHUB_REPO" ]]; then
+    echo "ERROR: No GitHub repo found in source=() line."
+    exit 1
+fi
+echo "==> GitHub repo: $GITHUB_REPO"
+
+# 1. Fetch latest release tag
+echo "==> Fetching latest GitHub release ..."
+latest_tag="$(fetch_latest_tag "$GITHUB_REPO")"
+
+if [[ -z "$latest_tag" ]]; then
+    echo "ERROR: Could not fetch latest release from GitHub."
+    exit 1
+fi
+
+# Strip leading 'v' and validate
+new_ver="${latest_tag#v}"
+if [[ ! "$new_ver" =~ ^[0-9] ]]; then
+    echo "ERROR: Tag '$latest_tag' → pkgver '$new_ver' does not start with a number."
+    exit 1
+fi
+
+old_ver="$(get_var pkgver)"
+
+if [[ "$old_ver" == "$new_ver" ]]; then
+    echo "==> pkgver already at $old_ver. No update needed."
+    exit 0
+fi
+
+echo "==> pkgver: $old_ver → $new_ver"
+
+# 2. Update pkgver in PKGBUILD
+sed -i "s/^pkgver=.*/pkgver=$new_ver/" PKGBUILD
+
+# 3. Update source tag references (e.g. #tag=v0.7.9)
+if grep -q '#tag=v' PKGBUILD; then
+    sed -i "s/#tag=v[0-9][0-9.]*/#tag=v${new_ver}/g" PKGBUILD
+    echo "==> Updated source tag references."
+fi
+
+# 4. Run updpkgsums to recalculate checksums from source URLs
+if ! command -v updpkgsums &>/dev/null; then
+    echo "ERROR: updpkgsums not found. Install 'pacman-contrib'."
+    exit 1
+fi
+
+echo "==> Running updpkgsums ..."
+if ! updpkgsums; then
+    echo "ERROR: updpkgsums failed."
+    exit 1
+fi
+echo "==> Checksums updated by updpkgsums."
+
+# 5. Update .SRCINFO
+echo "==> Generating .SRCINFO ..."
+if ! makepkg --printsrcinfo > .SRCINFO; then
+    echo "==> WARNING: makepkg --printsrcinfo failed (dependencies may be needed)."
+fi
+echo "==> .SRCINFO updated."
+
+echo ""
+echo "==> Done. pkgver: $old_ver → $new_ver"
+
+# ─── Ask to build ─────────────────────────────────────────────
+read -r -p "==> Build now? [y/N] " build_now
+if [[ "${build_now:-N}" =~ ^[Yy] ]]; then
+    echo "==> Building..."
+    if makepkg --noextract --syncdeps; then
+        echo "==> Build succeeded."
+    else
+        echo "==> Build failed (exit code: $?)."
+    fi
+fi
