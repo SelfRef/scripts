@@ -47,9 +47,9 @@ fi
 
 # ─── GitHub helpers ───────────────────────────────────────────
 extract_github_repo() {
-    # Pull the first source line, grab https://github.com/OWNER/REPO
+    # Extract all lines from source=() block, grab https://github.com/OWNER/REPO
     local src
-    src="$(grep -m1 '^source=' PKGBUILD)"
+    src="$(sed -n '/^source=/,/^)/p' PKGBUILD)"
     if [[ "$src" =~ github\.com/([^/]+)/([^/#.]+) ]]; then
         echo "${BASH_REMATCH[1]}/${BASH_REMATCH[2]}"
     fi
@@ -80,8 +80,8 @@ if (( IS_GIT )); then
 
     # Determine the tracked branch (default: master)
     branch="master"
-    if grep -q '#branch=' PKGBUILD; then
-        branch="$(grep -m1 '^source=' PKGBUILD | grep -o '#branch=[^ ]*' | cut -d= -f2)"
+    if sed -n '/^source=/,/^)/p' PKGBUILD | grep -q '#branch='; then
+        branch="$(sed -n '/^source=/,/^)/p' PKGBUILD | grep -o '#branch=[^ ]*' | head -1 | cut -d= -f2)"
     fi
 
     if [[ -d "$srcdir/.git" ]]; then
@@ -130,22 +130,25 @@ if [[ ! "$new_ver" =~ ^[0-9] ]]; then
     exit 1
 fi
 
+# Sanitize version for AUR pkgver (no hyphens, colons, forward slashes, whitespace)
+pkgver_sanitized="${new_ver//-/.}"
+
 old_ver="$(get_var pkgver)"
 
-if [[ "$old_ver" == "$new_ver" ]]; then
+if [[ "$old_ver" == "$pkgver_sanitized" ]]; then
     echo "==> pkgver already at $old_ver. No update needed."
     exit 0
 fi
 
-echo "==> pkgver: $old_ver → $new_ver"
+echo "==> pkgver: $old_ver → $pkgver_sanitized"
 
-# 2. Update pkgver in PKGBUILD
-sed -i "s/^pkgver=.*/pkgver=$new_ver/" PKGBUILD
+# 2. Update pkgver in PKGBUILD (sanitized version)
+sed -i "s/^pkgver=.*/pkgver=$pkgver_sanitized/" PKGBUILD
 
-# 3. Update source tag references (e.g. #tag=v0.7.9)
-if grep -q '#tag=v' PKGBUILD; then
-    sed -i "s/#tag=v[0-9][0-9.]*/#tag=v${new_ver}/g" PKGBUILD
-    echo "==> Updated source tag references."
+# 3. Update source tag references (e.g. #tag=v0.7.9) using the raw tag
+if sed -n '/^source=/,/^)/p' PKGBUILD | grep -q '#tag=v'; then
+    sed -i "s|#tag=v[0-9][0-9.a-z-]*|#tag=v${new_ver}|g" PKGBUILD
+    echo "==> Updated source tag references (v${new_ver})."
 fi
 
 # 4. Run updpkgsums to recalculate checksums from source URLs
@@ -169,7 +172,7 @@ fi
 echo "==> .SRCINFO updated."
 
 echo ""
-echo "==> Done. pkgver: $old_ver → $new_ver"
+echo "==> Done. pkgver: $old_ver → $pkgver_sanitized"
 
 # ─── Ask to build ─────────────────────────────────────────────
 read -r -p "==> Build now? [y/N] " build_now
