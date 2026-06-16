@@ -1,9 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-cd "$SCRIPT_DIR"
-
 # ─── Pre-flight ───────────────────────────────────────────────
 if [[ ! -f PKGBUILD ]]; then
     echo "ERROR: PKGBUILD not found in $(pwd)"
@@ -79,7 +76,7 @@ if (( IS_GIT )); then
 
     # 2. Check if pkgver (short commit hash) changed
     old_ver="$(get_var pkgver)"
-    srcdir="$SCRIPT_DIR/src/${PKGNAME%-git}"
+    srcdir="src/${PKGNAME%-git}"
 
     # Determine the tracked branch (default: master)
     branch="master"
