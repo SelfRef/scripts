@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
-# hf-rm -- Remove a specific file from a downloaded HuggingFace model.
-# Usage: ./hf-rm <model_id> <filename>
+# hf-rm -- Remove a specific file from, or delete an entire HuggingFace model.
+# Usage: ./hf-rm [--all] <model_id> [filename]
 #
-# Example:
-#   ./hf-rm unsloth/Qwen3.6-35B-A3B-GGUF mmproj-BF16.gguf
+# Examples:
+#   ./hf-rm unsloth/Qwen3.6-35B-A3B-GGUF          # list files
+#   ./hf-rm unsloth/Qwen3.6-35B-A3B-GGUF mmproj-BF16.gguf  # remove one file
+#   ./hf-rm --all unsloth/Qwen3.6-35B-A3B-GGUF    # delete entire model
 #
 # Removes the snapshot symlink AND the blob file.
 # If the blob is shared across multiple snapshots (rare), it preserves
@@ -15,6 +17,15 @@ set -euo pipefail
 
 HF_HOME="${HF_HOME:-/media/cache0/huggingface}"
 HUB="$HF_HOME/hub"
+
+# Parse flags
+DELETE_ALL=false
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --all|--delete-model) DELETE_ALL=true; shift ;;
+        *) break ;;
+    esac
+done
 
 [[ -d "$HUB" ]] || { echo "Cache not found: $HUB" >&2; exit 1; }
 
@@ -63,7 +74,8 @@ model_id="${1:-}"
 file_name="${2:-}"
 
 if [[ -z "$model_id" ]]; then
-    echo "Usage: $0 <model_id> [filename]" >&2
+    echo "Usage: $0 [--all] <model_id> [filename]" >&2
+    echo "  [--all]     delete entire model and all its files" >&2
     echo "  <model_id>  e.g. unsloth/Qwen3.6-35B-A3B-GGUF" >&2
     echo "  <filename>  remove this file (omit to list files)" >&2
     exit 1
@@ -76,6 +88,32 @@ if [[ -z "$mdir" ]]; then
 fi
 
 snap="$(resolve_snap "$mdir")"
+
+# -- Delete entire model if --all flag given --------------------------------
+if [[ "$DELETE_ALL" == true ]]; then
+    total_size=0
+    if [[ -d "$mdir/blobs" ]]; then
+        while IFS= read -r -d '' blob; do
+            sz="$(stat -c '%s' "$blob" 2>/dev/null)" || sz=0
+            total_size=$((total_size + sz))
+        done < <(find "$mdir/blobs" -type f -print0 2>/dev/null)
+    fi
+
+    echo "WARNING: This will delete the entire model: $model_id"
+    echo "  Location: $mdir"
+    echo "  Size: $(human_size "$total_size")"
+    read -rp "  Confirm deletion? (y/N): " reply
+    if [[ "$reply" == y || "$reply" == Y ]]; then
+        if ! rm -rf "$mdir" 2>/dev/null; then
+            echo "  Permission denied, retrying with sudo..."
+            sudo rm -rf "$mdir"
+        fi
+        echo "  Model deleted: $model_id"
+    else
+        echo "  Aborted."
+    fi
+    exit 0
+fi
 
 # -- List files if no filename given ----------------------------------------
 if [[ -z "$file_name" ]]; then
