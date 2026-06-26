@@ -1,0 +1,181 @@
+#!/usr/bin/env bash
+#
+# Sunshine prep-cmd: sets the monitor resolution/refresh rate and scaling
+# according to the parameters requested by the client, using kscreen-doctor (KDE).
+#
+# Requires environment variables set by Sunshine:
+#   SUNSHINE_CLIENT_WIDTH   - width (int)
+#   SUNSHINE_CLIENT_HEIGHT  - height (int)
+#   SUNSHINE_CLIENT_FPS     - refresh rate / FPS (int)
+#
+# All output is logged to "<script-name>.log" next to this script.
+#
+set -euo pipefail
+
+# ----------------------------------------------------------------------------
+# Configuration
+# ----------------------------------------------------------------------------
+REFRESH_MODE="reduced"        # custom mode timing - always "reduced" as required
+
+# When deciding whether the requested mode already exists, a mode counts as a
+# match if its resolution is identical and its refresh rate is within this many
+# Hz of the requested FPS. This is required because KWin snaps an added custom
+# mode to the panel's nearest real timing (e.g. you ask for @60, it reports
+# @59.88), and without tolerance the script would re-create a duplicate on
+# every run. Observed drift is up to ~1.4 Hz, so 2 Hz is a safe buffer that
+# still stays well clear of adjacent standard rates (50/60, 100/120, 144).
+REFRESH_TOLERANCE_HZ=2
+
+# Scaling thresholds by width (easy to tweak):
+#   width >= 3840              -> 2     (4K and above)
+#   width 2561 .. 3839         -> 1.5   (ultrawide / "in between", e.g. 3440x1440)
+#   width <= 2560              -> 1     (Full HD, QHD and below)
+SCALE_4K_MIN_WIDTH=3840
+SCALE_MID_MIN_WIDTH=2561
+
+# ----------------------------------------------------------------------------
+# Logging setup (must happen first, before anything can fail)
+# ----------------------------------------------------------------------------
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" >/dev/null 2>&1 && pwd -P)"
+SCRIPT_NAME="$(basename -- "${BASH_SOURCE[0]:-$0}")"
+LOG_FILE="${SCRIPT_DIR}/${SCRIPT_NAME%.*}.log"
+
+# Send all stdout+stderr to both the console and the log file.
+exec > >(tee -a "$LOG_FILE") 2>&1
+
+log() { printf '%s | %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"; }
+
+# On any failure, log the exact command and line that failed, then exit.
+trap 'rc=$?; log "ERROR: command failed (exit $rc) at line ${LINENO}: ${BASH_COMMAND}"; exit $rc' ERR
+
+log "==================== run start ===================="
+log "Session env: DISPLAY='${DISPLAY:-}' WAYLAND_DISPLAY='${WAYLAND_DISPLAY:-}' XDG_RUNTIME_DIR='${XDG_RUNTIME_DIR:-}' DBUS_SESSION_BUS_ADDRESS='${DBUS_SESSION_BUS_ADDRESS:-}'"
+
+# ----------------------------------------------------------------------------
+# Parameters from Sunshine + validation
+# ----------------------------------------------------------------------------
+W="${SUNSHINE_CLIENT_WIDTH:?Missing SUNSHINE_CLIENT_WIDTH variable}"
+H="${SUNSHINE_CLIENT_HEIGHT:?Missing SUNSHINE_CLIENT_HEIGHT variable}"
+FPS="${SUNSHINE_CLIENT_FPS:?Missing SUNSHINE_CLIENT_FPS variable}"
+log "Requested by client: width=${W} height=${H} fps=${FPS}"
+
+for pair in "W=$W" "H=$H" "FPS=$FPS"; do
+  val="${pair#*=}"
+  [[ "$val" =~ ^[0-9]+$ ]] || { log "Invalid (non-numeric) value: $pair"; exit 1; }
+done
+
+command -v kscreen-doctor >/dev/null 2>&1 || { log "kscreen-doctor not found in PATH."; exit 1; }
+
+TARGET_MODE="${W}x${H}@${FPS}"
+
+# ----------------------------------------------------------------------------
+# Helper: kscreen-doctor -o with ANSI color codes stripped
+# ----------------------------------------------------------------------------
+get_outputs() {
+  kscreen-doctor -o 2>&1 | sed -E 's/\x1b\[[0-9;]*m//g'
+}
+
+# Parse the (possibly multi-line) output of "kscreen-doctor -o" into one line
+# per enabled+connected output:   <id>\t<name>\t<all-block-text>
+# The whole block text is emitted (tabs flattened to spaces) so the mode search
+# sees both the "Modes:" list and the accumulated "Custom modes:" entries.
+# Works for both the multi-line format and the legacy single-line format.
+parse_connected() {
+  awk '
+    function flush() {
+      if (in_block && en && conn)
+        printf "%s\t%s\t%s\n", id, name, modes
+      in_block=0; en=0; conn=0; id=""; name=""; modes=""
+    }
+    /^Output:/ { flush(); in_block=1; id=$2; name=$3 }
+    in_block {
+      for (i = 1; i <= NF; i++) {
+        if ($i == "enabled")   en=1
+        if ($i == "connected") conn=1
+      }
+      line=$0; gsub(/\t/, " ", line)
+      modes = modes " " line
+    }
+    END { flush() }
+  '
+}
+
+# Look for a mode that matches WxH with a refresh within REFRESH_TOLERANCE_HZ of
+# the requested FPS. Prints the matched refresh (e.g. "59.88") and exits 0 if
+# found; exits 1 otherwise. Token examples it understands:
+#   73:3440x1440@59.97*      (Modes: list entry, may end with ! or *)
+#   3440x1440@59.88          (Custom modes: entry)
+find_close_refresh() {
+  awk -v w="$W" -v h="$H" -v fps="$FPS" -v tol="$REFRESH_TOLERANCE_HZ" '
+  {
+    for (i = 1; i <= NF; i++) {
+      t = $i
+      gsub(/[*!]+$/, "", t)                 # strip trailing markers
+      ci = index(t, ":"); if (ci > 0) t = substr(t, ci + 1)   # drop leading "id:"
+      ai = index(t, "@"); if (ai == 0) continue
+      res = substr(t, 1, ai - 1)
+      rr  = substr(t, ai + 1) + 0           # numeric refresh
+      if (res == w "x" h) {
+        d = rr - fps; if (d < 0) d = -d
+        if (d <= tol && (!found || d < bestd)) { found = 1; bestd = d; bestrr = rr }
+      }
+    }
+  }
+  END { if (found) { printf "%.2f\n", bestrr; exit 0 } else exit 1 }
+  '
+}
+
+# ----------------------------------------------------------------------------
+# 1. Find the active, connected output and grab its id
+# ----------------------------------------------------------------------------
+OUTPUTS="$(get_outputs)"
+log "----- kscreen-doctor -o -----"
+printf '%s\n' "$OUTPUTS"
+log "-----------------------------"
+
+connected_line="$(printf '%s\n' "$OUTPUTS" | parse_connected | head -n1 || true)"
+
+if [[ -z "$connected_line" ]]; then
+  log "No active (enabled) and connected monitor found."
+  exit 1
+fi
+
+IFS=$'\t' read -r OUT_ID OUT_NAME MODES_STR <<<"$connected_line"
+log "Monitor: id=${OUT_ID} (${OUT_NAME})"
+log "Target mode: ${TARGET_MODE} (refresh tolerance +/-${REFRESH_TOLERANCE_HZ} Hz)"
+
+# ----------------------------------------------------------------------------
+# 2. Is the mode already supported (natively OR as a previously added custom)?
+#    Tolerant match avoids re-creating duplicates when KWin snaps @60 -> @59.xx.
+# ----------------------------------------------------------------------------
+if matched_rr="$(find_close_refresh <<<"$MODES_STR")"; then
+  log "Mode ${W}x${H} @ ~${FPS} already present (found @${matched_rr}) - skipping custom mode creation."
+else
+  # --------------------------------------------------------------------------
+  # 3. Add a custom mode (refresh in mHz = FPS * 1000, e.g. 60 -> 60000)
+  # --------------------------------------------------------------------------
+  REFRESH_MHZ=$(( FPS * 1000 ))
+  log "No ${W}x${H} mode within tolerance - adding custom mode (${REFRESH_MODE})."
+  log "RUN: kscreen-doctor output.${OUT_ID}.addCustomMode.${W}.${H}.${REFRESH_MHZ}.${REFRESH_MODE}"
+  kscreen-doctor "output.${OUT_ID}.addCustomMode.${W}.${H}.${REFRESH_MHZ}.${REFRESH_MODE}"
+fi
+
+# ----------------------------------------------------------------------------
+# 4. Determine scaling based on width
+# ----------------------------------------------------------------------------
+if   (( W >= SCALE_4K_MIN_WIDTH ));  then SCALE="2"
+elif (( W >= SCALE_MID_MIN_WIDTH )); then SCALE="1.5"
+else                                      SCALE="1"
+fi
+log "Scaling: ${SCALE}"
+
+# ----------------------------------------------------------------------------
+# 5. Set the mode and scaling in a single command
+#    Setting "@${FPS}" works even when the real timing is @59.xx (KWin matches
+#    the closest mode), so we keep the clean integer request here.
+# ----------------------------------------------------------------------------
+log "RUN: kscreen-doctor output.${OUT_ID}.mode.${TARGET_MODE} output.${OUT_ID}.scale.${SCALE}"
+kscreen-doctor "output.${OUT_ID}.mode.${TARGET_MODE}" "output.${OUT_ID}.scale.${SCALE}"
+
+log "Done: ${TARGET_MODE} @ scale ${SCALE} on monitor ${OUT_ID} (${OUT_NAME})."
+log "===================== run end ====================="
